@@ -1,6 +1,6 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
-const path = require('path');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,40 +16,28 @@ app.get('/get-rank', async (req, res) => {
 
   let browser;
   try {
-    // 起動設定（Render対応の安定構成）
-    const launchOptions = {
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-      ]
-    };
-
-    // RenderのキャッシュパスにChromeが存在する場合は指定
-    const cachePath = process.env.PUPPETEER_CACHE_DIR || '/opt/render/.cache/puppeteer';
-    
-    browser = await puppeteer.launch(launchOptions);
+    // @sparticuz/chromium を使って超軽量＆依存問題ゼロで起動
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
 
     const page = await browser.newPage();
     
-    // 軽量化処理
+    // 画像やフォントの読み込みをカットして高速化
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
+      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
 
     let detectedRank = 0;
 
@@ -105,7 +93,7 @@ app.get('/get-rank', async (req, res) => {
 
   } catch (error) {
     if (browser) await browser.close();
-    console.error('Scraping Error Detail:', error.message);
+    console.error('Scraping Error:', error.message);
     return res.status(500).json({ error: error.message });
   }
 });
