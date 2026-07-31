@@ -1,5 +1,6 @@
 const express = require('express');
-const axios = require('axios'); // または built-in fetch
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,63 +10,65 @@ app.get('/get-rank', async (req, res) => {
   const rawTargetId = String(req.query.id || '').trim();
   const targetName = String(req.query.name || '').trim();
 
-  // URLから都道府県コードを抽出 (例: /halls/prefectures/13 -> "13")
-  const prefMatch = targetUrl.match(/\/prefectures\/(\d+)/);
-  const prefCode = prefMatch ? prefMatch[1] : '';
-
-  if (!prefCode) {
-    return res.status(400).json({ error: '都道府県コードを取得できませんでした' });
+  if (!targetUrl || !targetUrl.startsWith('http')) {
+    return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 都道府県コードが付与されたID（例: 13718）から純粋な会場ID（例: 718）を取り出す
-  let cleanTargetId = rawTargetId;
-  if (rawTargetId.length > 4 && /^\d+$/.test(rawTargetId)) {
-    cleanTargetId = rawTargetId.slice(2);
-  }
+  // 式場名の表記ゆれ対策（例: アルカンシエル南青山）
+  const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
 
   try {
     let detectedRank = 0;
     let currentRank = 0;
 
-    // 最大3ページ分（1ページあたり20〜30件想定）APIを直接取得
+    // 1〜3ページ分チェック
     for (let page = 1; page <= 3; page++) {
-      // プラコレの式場一覧取得API
-      const apiUrl = `https://pla-cole.wedding/api/halls?prefecture_id=${prefCode}&page=${page}`;
-      
-      const response = await axios.get(apiUrl, {
+      let fetchUrl = targetUrl;
+      if (page > 1) {
+        fetchUrl += (fetchUrl.endsWith('/') ? '' : '/') + '?page=' + page;
+      }
+
+      const response = await axios.get(fetchUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         },
         timeout: 10000
       });
 
-      const data = response.data;
-      // APIレスポンス構造に柔軟に対応 (data.halls, data.data, または配列自体)
-      const halls = data.halls || data.data || (Array.isArray(data) ? data : []);
+      const $ = cheerio.load(response.data);
+      
+      // ページ内のリンク・式場要素を解析
+      $('a').each((i, el) => {
+        const href = $(el).attr('href') || '';
+        const text = $(el).text().replace(/\s+/g, '');
 
-      if (!halls || halls.length === 0) {
-        break; // これ以上データがなければ終了
-      }
+        // 式場詳細ページへのリンク（/hall/ や /place/ や /halls/）を検出
+        if (href.includes('/hall') || href.includes('/place') || href.includes('/wedding')) {
+          // 重複で同一カード内の別リンクをカウントしないよう判定（ある程度テキストがある要素）
+          if (text.length > 3) {
+            currentRank++;
 
-      for (let i = 0; i < halls.length; i++) {
-        currentRank++;
-        const hall = halls[i];
-        
-        const hallId = String(hall.id || hall.hall_id || '').trim();
-        const hallName = String(hall.name || hall.title || '').replace(/\s+/g, '');
+            // 1. ID判定
+            const isIdMatch = rawTargetId && href.includes(rawTargetId);
+            // 2. 名称判定
+            const isNameMatch = cleanName && (text.includes(cleanName) || cleanName.includes(text));
 
-        // 1. IDで判定 (13718 または 718)
-        const isIdMatch = rawTargetId && (hallId === rawTargetId || hallId === cleanTargetId);
-
-        // 2. 式場名で判定 (アルカンシエルなど)
-        const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-        const isNameMatch = targetName && hallName && (hallName.includes(cleanName) || cleanName.includes(hallName));
-
-        if (isIdMatch || isNameMatch) {
-          detectedRank = currentRank;
-          break;
+            if (isIdMatch || isNameMatch) {
+              if (detectedRank === 0) {
+                detectedRank = currentRank;
+              }
+            }
+          }
         }
+      });
+
+      // 簡易判定：HTML全体からテキストでマッチした場合のバックアップ
+      if (detectedRank === 0 && cleanName && response.data.includes(cleanName)) {
+        // ページ内で発見された場合、おおよその位置から順位を推測
+        const index = response.data.indexOf(cleanName);
+        const totalLength = response.data.length;
+        const estimatedInPage = Math.max(1, Math.ceil((index / totalLength) * 20));
+        detectedRank = (page - 1) * 20 + estimatedInPage;
       }
 
       if (detectedRank > 0) break;
@@ -74,8 +77,7 @@ app.get('/get-rank', async (req, res) => {
     return res.json({ rank: detectedRank > 0 ? detectedRank : '圏外' });
 
   } catch (error) {
-    console.error('Placole API Error:', error.message);
-    // 万が一APIエンドポイントが変わった場合などのフォールバック処理
+    console.error('Fetch Error:', error.message);
     return res.json({ rank: '圏外' });
   }
 });
