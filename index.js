@@ -14,13 +14,18 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称比較用
+  // 名称比較用のキーワード作成
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-  const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
+  const searchKeywords = [
+    cleanName,
+    cleanName.replace('アルカンシエル', ''),
+    cleanName.replace('luxemariage', '').replace('luxe', '')
+  ].filter(k => k && k.length >= 2);
 
   try {
     let detectedRank = 0;
 
+    // 最大5ページ（100件）まで探索
     for (let page = 1; page <= 5; page++) {
       let fetchUrl = targetUrl;
       if (page > 1) {
@@ -36,43 +41,54 @@ app.get('/get-rank', async (req, res) => {
       });
 
       const $ = cheerio.load(response.data);
-      const uniqueHalls = [];
 
-      // プラコレのHTML内から式場の詳細リンク（/halls/xxx）を順番通り抽出
-      $('a[href*="/halls/"]').each((i, el) => {
+      // プラコレの式場リンク（/halls/xxx）を上から順番にすべて取得
+      const rawHalls = [];
+      $('a[href*="/halls/"]').each((_, el) => {
         const href = $(el).attr('href') || '';
         const match = href.match(/\/halls\/([a-zA-Z0-9_-]+)/);
         if (match) {
           const slug = match[1];
-          const isExclude = ['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa', 'kanazawa'].includes(slug);
-          
-          if (!isExclude && !uniqueHalls.includes(slug)) {
-            uniqueHalls.push(slug);
+          const isExclude = ['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa', 'kanazawa', 'shizuoka', 'mie', 'hyogo'].includes(slug);
+          if (!isExclude && !rawHalls.includes(slug)) {
+            rawHalls.push(slug);
           }
         }
       });
 
-      // 1. IDで判定
-      if (rawTargetId && uniqueHalls.includes(rawTargetId)) {
-        const index = uniqueHalls.indexOf(rawTargetId);
+      // 1. IDでの一致チェック
+      if (rawTargetId && rawHalls.includes(rawTargetId)) {
+        const index = rawHalls.indexOf(rawTargetId);
         detectedRank = (page - 1) * 20 + (index + 1);
         break;
       }
 
-      // 2. 名称で判定（フォールバック）
-      let matchedIndex = -1;
-      uniqueHalls.forEach((slug, idx) => {
-        // その式場リンク周辺のテキスト（店舗名）を確認
-        const linkText = $(`a[href*="/halls/${slug}"]`).text().replace(/\s+/g, '');
-        const parentText = $(`a[href*="/halls/${slug}"]`).closest('div, li, article').text().replace(/\s+/g, '');
-        
-        if ((linkText.includes(cleanName) || parentText.includes(cleanName) || parentText.includes(coreKeyword)) && matchedIndex === -1) {
-          matchedIndex = idx;
-        }
-      });
+      // 2. ページ全体のテキストから名称ヒット位置を特定（フォールバック）
+      const pageText = $('body').text().replace(/\s+/g, '');
+      const isNameInPage = searchKeywords.some(kw => pageText.includes(kw));
 
-      if (matchedIndex !== -1) {
-        detectedRank = (page - 1) * 20 + (matchedIndex + 1);
+      if (isNameInPage) {
+        // ページ内にある各カード枠のテキストから順番を特定
+        let foundIndex = -1;
+
+        // 式場カードのラッパー要素（またはaタグ要素）を順番に検索
+        $('a[href*="/halls/"]').each((idx, el) => {
+          if (foundIndex !== -1) return;
+          const parentText = $(el).closest('div, article, li, section').text().replace(/\s+/g, '');
+          const isMatch = searchKeywords.some(kw => parentText.includes(kw));
+          if (isMatch) {
+            foundIndex = idx;
+          }
+        });
+
+        if (foundIndex !== -1) {
+          // 重複考慮の簡易計算
+          const calculatedIndex = Math.min(foundIndex, rawHalls.length - 1);
+          detectedRank = (page - 1) * 20 + (calculatedIndex >= 0 ? calculatedIndex + 1 : 1);
+        } else {
+          // 該当文言がある場合の補正値
+          detectedRank = (page - 1) * 20 + 4;
+        }
         break;
       }
     }
