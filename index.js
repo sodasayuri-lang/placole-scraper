@@ -6,16 +6,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/get-rank', async (req, res) => {
-  const targetUrl = req.query.url;
+  const targetUrl = req.query.url || '';
   const rawTargetId = String(req.query.id || '').trim();
   const targetName = String(req.query.name || '').trim();
 
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'URL is required' });
+  // URLから都道府県コードを抽出 (例: https://pla-cole.wedding/halls/prefectures/13 -> "13")
+  const prefMatch = targetUrl.match(/\/prefectures\/(\d+)/);
+  const prefCode = prefMatch ? prefMatch[1] : '';
+
+  if (!prefCode && !targetUrl) {
+    return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 都道府県コード（先頭2桁）をカットした純粋な式場ID
-  // 例: "13718" -> "718", "141287" -> "1287"
+  // IDから純粋な会場ID（末尾）を取り出す
   let cleanTargetId = rawTargetId;
   if (rawTargetId.length > 4 && /^\d+$/.test(rawTargetId)) {
     cleanTargetId = rawTargetId.slice(2);
@@ -24,100 +27,80 @@ app.get('/get-rank', async (req, res) => {
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled'
-      ],
-      defaultViewport: { width: 1280, height: 800 },
+      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
+      defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
     });
 
     const page = await browser.newPage();
-
-    // PC標準のUser-Agentを設定
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
     let detectedRank = 0;
+    let currentRank = 0;
 
+    // 1〜3ページ分巡回
     for (let p = 1; p <= 3; p++) {
+      // プラコレが実際に裏で叩いている内部APIまたは検索ページを読み込み
       let pageUrl = targetUrl;
       if (p > 1) {
         pageUrl += (pageUrl.includes('?') ? '&' : '?') + 'page=' + p;
       }
 
-      try {
-        await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      } catch (e) {
-        // タイムアウトしてもそのまま処理を進める
-      }
+      await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 20000 });
 
-      // React/Vue等のJavaScript描画をしっかり1.5秒待つ
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      // ページ内の全aタグ、または内部データストアから会場一覧情報を一括全抽出
+      const hallList = await page.evaluate(() => {
+        const results = [];
+        const seen = new Set();
 
-      // ページの「生のHTML文字列」を取得
-      const htmlContent = await page.content();
+        // 1. DOM上の全リンクから抽出
+        const links = Array.from(document.querySelectorAll('a'));
+        for (const a of links) {
+          const href = a.getAttribute('href') || '';
+          const text = (a.innerText || a.textContent || '').replace(/\s+/g, '');
+          const match = href.match(/\/(?:halls|places|wedding)\/(\d+)/);
 
-      // 1. HTML内から `/halls/数字` または `data-hall-id` 等のパターンを正規表現で全抽出
-      const hallIdMatches = htmlContent.match(/\/(?:halls|places|wedding)\/(\d+)/gi) || [];
-      
-      const foundIds = [];
-      const seenIds = new Set();
-
-      for (const matchStr of hallIdMatches) {
-        const idMatch = matchStr.match(/(\d+)/);
-        if (idMatch) {
-          const id = idMatch[1];
-          if (!seenIds.has(id)) {
-            seenIds.add(id);
-            foundIds.push(id);
+          if (match) {
+            const id = match[1];
+            if (!seen.has(id)) {
+              seen.add(id);
+              results.push({ id: id, name: text });
+            }
           }
         }
-      }
 
-      // 式場ID（例: 718 や 13718）での一致チェック
-      for (let i = 0; i < foundIds.length; i++) {
-        if (foundIds[i] === rawTargetId || foundIds[i] === cleanTargetId) {
-          detectedRank = (p - 1) * 20 + (i + 1);
-          break;
-        }
-      }
-
-      // 2. IDで引っかからなかった場合、HTML内の式場名テキストでの判定
-      if (detectedRank === 0 && targetName) {
-        const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-        // 主要キーワード（例: "アルカンシエル"）
-        const coreKeyword = cleanName.substring(0, 6);
-
-        if (htmlContent.includes(cleanName) || (coreKeyword.length >= 3 && htmlContent.includes(coreKeyword))) {
-          // DOMから一覧要素の順位を推測・算出
-          const rankInPage = await page.evaluate((searchName, searchKeyword) => {
-            const elements = Array.from(document.querySelectorAll('a, h2, h3, div'));
-            let currentRank = 0;
-            const seen = new Set();
-
-            for (const el of elements) {
-              const text = (el.innerText || '').replace(/\s+/g, '');
-              const href = el.getAttribute('href') || '';
-              
-              if (href.includes('/halls/') && !seen.has(href)) {
-                seen.add(href);
-                currentRank++;
-                if (text.includes(searchName) || (searchKeyword && text.includes(searchKeyword))) {
-                  return currentRank;
-                }
+        // 2. もしDOMから拾えなかった場合、Next.jsの内部データ(__NEXT_DATA__)から抽出
+        if (results.length === 0 && window.__NEXT_DATA__) {
+          try {
+            const strData = JSON.stringify(window.__NEXT_DATA__);
+            const idMatches = strData.match(/\\\\?\/halls\\\\?\/(\d+)/g) || strData.match(/"id":(\d+)/g) || [];
+            for (const m of idMatches) {
+              const num = m.match(/\d+/)[0];
+              if (!seen.has(num)) {
+                seen.add(num);
+                results.push({ id: num, name: '' });
               }
             }
-            return 0;
-          }, cleanName, coreKeyword);
+          } catch (e) {}
+        }
 
-          if (rankInPage > 0) {
-            detectedRank = (p - 1) * 20 + rankInPage;
-          }
+        return results;
+      });
+
+      // 順位の判定処理
+      for (let i = 0; i < hallList.length; i++) {
+        currentRank++;
+        const item = hallList[i];
+
+        // ID一致チェック (13718 / 718 両対応)
+        const isIdMatch = rawTargetId && (item.id === rawTargetId || item.id === cleanTargetId);
+        
+        // 店名一致チェック (アルカンシエルなど)
+        const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
+        const isNameMatch = targetName && item.name && (item.name.includes(cleanName) || cleanName.includes(item.name));
+
+        if (isIdMatch || isNameMatch) {
+          detectedRank = currentRank;
+          break;
         }
       }
 
