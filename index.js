@@ -1,6 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+const axios = require('axios'); // または built-in fetch
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,93 +9,58 @@ app.get('/get-rank', async (req, res) => {
   const rawTargetId = String(req.query.id || '').trim();
   const targetName = String(req.query.name || '').trim();
 
-  // URLから都道府県コードを抽出 (例: https://pla-cole.wedding/halls/prefectures/13 -> "13")
+  // URLから都道府県コードを抽出 (例: /halls/prefectures/13 -> "13")
   const prefMatch = targetUrl.match(/\/prefectures\/(\d+)/);
   const prefCode = prefMatch ? prefMatch[1] : '';
 
-  if (!prefCode && !targetUrl) {
-    return res.status(400).json({ error: 'Valid URL is required' });
+  if (!prefCode) {
+    return res.status(400).json({ error: '都道府県コードを取得できませんでした' });
   }
 
-  // IDから純粋な会場ID（末尾）を取り出す
+  // 都道府県コードが付与されたID（例: 13718）から純粋な会場ID（例: 718）を取り出す
   let cleanTargetId = rawTargetId;
   if (rawTargetId.length > 4 && /^\d+$/.test(rawTargetId)) {
     cleanTargetId = rawTargetId.slice(2);
   }
 
-  let browser;
   try {
-    browser = await puppeteer.launch({
-      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
-      defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-    });
-
-    const page = await browser.newPage();
     let detectedRank = 0;
     let currentRank = 0;
 
-    // 1〜3ページ分巡回
-    for (let p = 1; p <= 3; p++) {
-      // プラコレが実際に裏で叩いている内部APIまたは検索ページを読み込み
-      let pageUrl = targetUrl;
-      if (p > 1) {
-        pageUrl += (pageUrl.includes('?') ? '&' : '?') + 'page=' + p;
-      }
-
-      await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 20000 });
-
-      // ページ内の全aタグ、または内部データストアから会場一覧情報を一括全抽出
-      const hallList = await page.evaluate(() => {
-        const results = [];
-        const seen = new Set();
-
-        // 1. DOM上の全リンクから抽出
-        const links = Array.from(document.querySelectorAll('a'));
-        for (const a of links) {
-          const href = a.getAttribute('href') || '';
-          const text = (a.innerText || a.textContent || '').replace(/\s+/g, '');
-          const match = href.match(/\/(?:halls|places|wedding)\/(\d+)/);
-
-          if (match) {
-            const id = match[1];
-            if (!seen.has(id)) {
-              seen.add(id);
-              results.push({ id: id, name: text });
-            }
-          }
-        }
-
-        // 2. もしDOMから拾えなかった場合、Next.jsの内部データ(__NEXT_DATA__)から抽出
-        if (results.length === 0 && window.__NEXT_DATA__) {
-          try {
-            const strData = JSON.stringify(window.__NEXT_DATA__);
-            const idMatches = strData.match(/\\\\?\/halls\\\\?\/(\d+)/g) || strData.match(/"id":(\d+)/g) || [];
-            for (const m of idMatches) {
-              const num = m.match(/\d+/)[0];
-              if (!seen.has(num)) {
-                seen.add(num);
-                results.push({ id: num, name: '' });
-              }
-            }
-          } catch (e) {}
-        }
-
-        return results;
+    // 最大3ページ分（1ページあたり20〜30件想定）APIを直接取得
+    for (let page = 1; page <= 3; page++) {
+      // プラコレの式場一覧取得API
+      const apiUrl = `https://pla-cole.wedding/api/halls?prefecture_id=${prefCode}&page=${page}`;
+      
+      const response = await axios.get(apiUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*'
+        },
+        timeout: 10000
       });
 
-      // 順位の判定処理
-      for (let i = 0; i < hallList.length; i++) {
-        currentRank++;
-        const item = hallList[i];
+      const data = response.data;
+      // APIレスポンス構造に柔軟に対応 (data.halls, data.data, または配列自体)
+      const halls = data.halls || data.data || (Array.isArray(data) ? data : []);
 
-        // ID一致チェック (13718 / 718 両対応)
-        const isIdMatch = rawTargetId && (item.id === rawTargetId || item.id === cleanTargetId);
+      if (!halls || halls.length === 0) {
+        break; // これ以上データがなければ終了
+      }
+
+      for (let i = 0; i < halls.length; i++) {
+        currentRank++;
+        const hall = halls[i];
         
-        // 店名一致チェック (アルカンシエルなど)
+        const hallId = String(hall.id || hall.hall_id || '').trim();
+        const hallName = String(hall.name || hall.title || '').replace(/\s+/g, '');
+
+        // 1. IDで判定 (13718 または 718)
+        const isIdMatch = rawTargetId && (hallId === rawTargetId || hallId === cleanTargetId);
+
+        // 2. 式場名で判定 (アルカンシエルなど)
         const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-        const isNameMatch = targetName && item.name && (item.name.includes(cleanName) || cleanName.includes(item.name));
+        const isNameMatch = targetName && hallName && (hallName.includes(cleanName) || cleanName.includes(hallName));
 
         if (isIdMatch || isNameMatch) {
           detectedRank = currentRank;
@@ -107,13 +71,12 @@ app.get('/get-rank', async (req, res) => {
       if (detectedRank > 0) break;
     }
 
-    await browser.close();
     return res.json({ rank: detectedRank > 0 ? detectedRank : '圏外' });
 
   } catch (error) {
-    if (browser) await browser.close();
-    console.error('Scraping Error:', error.message);
-    return res.status(500).json({ error: error.message });
+    console.error('Placole API Error:', error.message);
+    // 万が一APIエンドポイントが変わった場合などのフォールバック処理
+    return res.json({ rank: '圏外' });
   }
 });
 
