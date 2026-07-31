@@ -13,14 +13,14 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称比較用の表記ゆれ対策（「アルカンシエル」等のコアワード）
+  // 名称検索用の基本キーワード
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
   const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
 
   try {
     let detectedRank = 0;
 
-    // 最大5ページまで検索
+    // 最大5ページまで走査
     for (let page = 1; page <= 5; page++) {
       let fetchUrl = targetUrl;
       if (page > 1) {
@@ -37,48 +37,69 @@ app.get('/get-rank', async (req, res) => {
 
       const html = response.data;
 
-      // 1. 式場カードリンク（/halls/数字 または /halls/文字列）の全抽出
-      // プラコレの式場詳細リンクのパターンを正確に走査
-      const linkMatches = html.match(/\/halls\/(?!prefectures|area|search)[a-zA-Z0-9_-]+/g) || [];
+      // --- アプローチ1: プラコレのメイン一覧ブロック/カード要素を順番に抽出 ---
+      // メインの式場カードブロック（<article>タグ または 式場カードを構成するクラス）を分割取得
+      let cards = html.split(/<article\b[^>]*>/i);
       
-      const hallList = [];
-      linkMatches.forEach(link => {
-        const idOrSlug = link.replace('/halls/', '');
-        if (!hallList.includes(idOrSlug)) {
-          hallList.push(idOrSlug);
-        }
-      });
-
-      // リンク一覧からIDの一致を判定
-      if (hallList.length > 0 && rawTargetId) {
-        const index = hallList.indexOf(rawTargetId);
-        if (index !== -1) {
-          detectedRank = (page - 1) * 20 + (index + 1);
-          break;
-        }
+      // articleタグで分割できなかった場合、hallsリンクを含む大きなブロック単位で分割
+      if (cards.length <= 1) {
+        cards = html.split(/(?=<div[^>]*class="[^"]*(?:card|item|hall)[^"]*")/i);
       }
 
-      // 2. HTML内の式場ブロック（articleやcard要素）からテキスト順を解析
-      // IDで引けなかった場合、HTML上での式場名の登場位置（順番）をカウント
-      const h2andH3Matches = html.match(/<(h[23]|div)[^>]*>([\s\S]*?)<\/(h[23]|div)>/gi) || [];
-      let currentItemRank = 0;
-      let foundInBlock = false;
+      let currentCardRank = 0;
+      let found = false;
 
-      for (const block of h2andH3Matches) {
-        const cleanBlockText = block.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
-        
-        // 式場名らしい要素だけをカウント
-        if (cleanBlockText.length > 3 && (cleanBlockText.includes('アルカンシエル') || cleanBlockText.includes('結婚式場') || cleanBlockText.includes('フェア'))) {
-          currentItemRank++;
-          if (cleanBlockText.includes(cleanName) || cleanBlockText.includes(coreKeyword)) {
-            detectedRank = (page - 1) * 20 + currentItemRank;
-            foundInBlock = true;
+      // 最初の分割要素はヘッダー領域なのでスキップ（i = 1から開始）
+      for (let i = 1; i < cards.length; i++) {
+        const cardHtml = cards[i];
+
+        // そのブロックが「式場カード」としてのリンクや主要テキストを含んでいるか判定
+        if (cardHtml.includes('/halls/') || cardHtml.includes('c-card') || cardHtml.includes('p-hall')) {
+          currentCardRank++;
+
+          // 1. ID判定
+          const isIdMatch = rawTargetId && (
+            cardHtml.includes(`/halls/${rawTargetId}`) || 
+            cardHtml.includes(`"id":${rawTargetId}`) || 
+            cardHtml.includes(`"id":"${rawTargetId}"`)
+          );
+
+          // 2. 名称判定
+          const cleanCardText = cardHtml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+          const isNameMatch = cleanCardText.includes(cleanName) || cleanCardText.includes(coreKeyword);
+
+          if (isIdMatch || isNameMatch) {
+            detectedRank = (page - 1) * 20 + currentCardRank;
+            found = true;
             break;
           }
         }
       }
 
-      if (foundInBlock || detectedRank > 0) break;
+      if (found) break;
+
+      // --- アプローチ2: 直送の式場詳細リンクからユニーク順を判定（フォールバック） ---
+      if (detectedRank === 0) {
+        // メインエリアに存在する /halls/ID のリンクパターンを出現順に取得
+        const matches = html.match(/\/halls\/([a-zA-Z0-9_-]+)/g) || [];
+        const uniqueHalls = [];
+
+        for (const match of matches) {
+          const id = match.replace('/halls/', '');
+          // ナビゲーションやエリア指定などの除外ワード
+          if (!['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa'].includes(id)) {
+            if (!uniqueHalls.includes(id)) {
+              uniqueHalls.push(id);
+            }
+          }
+        }
+
+        if (rawTargetId && uniqueHalls.includes(rawTargetId)) {
+          const idx = uniqueHalls.indexOf(rawTargetId);
+          detectedRank = (page - 1) * 20 + (idx + 1);
+          break;
+        }
+      }
     }
 
     return res.json({ rank: detectedRank > 0 ? detectedRank : '圏外' });
