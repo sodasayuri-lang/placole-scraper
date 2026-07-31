@@ -15,35 +15,35 @@ app.get('/get-rank', async (req, res) => {
 
   let browser;
   try {
-    // 低スペック環境でも安定して動作させるためのPuppeteer起動オプション
+    // インストールされたChromeのパスを明示的に指定して起動
     browser = await puppeteer.launch({
-      headless: 'new',
+      executablePath: puppeteer.executablePath(),
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
+        '--single-process'
       ]
     });
 
     const page = await browser.newPage();
     
-    // 画像やフォントの読み込みをブロックして軽量化＆高速化
+    // 軽量化処理
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+      const type = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
         req.abort();
       } else {
         req.continue();
       }
     });
 
-    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
 
     let detectedRank = 0;
 
@@ -53,9 +53,7 @@ app.get('/get-rank', async (req, res) => {
         pageUrl += (pageUrl.includes('?') ? '&' : '?') + 'page=' + p;
       }
 
-      // タイムアウトを設けて安全にアクセス
-      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-      await page.waitForTimeout(1000); // 動的要素の描画待ち
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
       const hallLinks = await page.evaluate(() => {
         const anchors = Array.from(document.querySelectorAll('a[href*="/halls/"], a[href*="/place/"]'));
@@ -101,7 +99,7 @@ app.get('/get-rank', async (req, res) => {
 
   } catch (error) {
     if (browser) await browser.close();
-    console.error('Scraping Error:', error.message);
+    console.error('Scraping Error Detail:', error);
     return res.status(500).json({ error: error.message });
   }
 });
