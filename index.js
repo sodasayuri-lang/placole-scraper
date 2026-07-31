@@ -16,7 +16,6 @@ app.get('/get-rank', async (req, res) => {
 
   let browser;
   try {
-    // @sparticuz/chromium を使って超軽量＆依存問題ゼロで起動
     browser = await puppeteer.launch({
       args: chromium.args,
       defaultViewport: chromium.defaultViewport,
@@ -25,7 +24,7 @@ app.get('/get-rank', async (req, res) => {
     });
 
     const page = await browser.newPage();
-    
+
     // 画像やフォントの読み込みをカットして高速化
     await page.setRequestInterception(true);
     page.on('request', (req) => {
@@ -47,38 +46,58 @@ app.get('/get-rank', async (req, res) => {
         pageUrl += (pageUrl.includes('?') ? '&' : '?') + 'page=' + p;
       }
 
-      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+      // 動的コンテンツ描画待ちのために2秒ストップ
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
       const hallLinks = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll('a[href*="/halls/"], a[href*="/place/"]'));
+        // プラコレの全リンクを探索
+        const anchors = Array.from(document.querySelectorAll('a'));
         const list = [];
         const seen = new Set();
 
         for (const a of anchors) {
           const href = a.getAttribute('href') || '';
-          const match = href.match(/\/(?:halls|place)\/([a-zA-Z0-9_-]+)/);
+          const text = (a.innerText || '').replace(/\s+/g, '');
+
+          // URLまたは属性からIDを抽出するパターン
+          const match = href.match(/\/(?:halls|place|wedding|places)\/([a-zA-Z0-9_-]+)/);
           if (match) {
             const id = match[1].toLowerCase();
-            if (!seen.has(id) && !['search', 'list', 'prefectures', 'areas'].includes(id)) {
+            if (!seen.has(id) && !['search', 'list', 'prefectures', 'areas', 'item'].includes(id)) {
               seen.add(id);
-              list.push({ id: id, text: a.innerText.replace(/\s+/g, '') });
+              list.push({ id: id, text: text, href: href });
+            }
+          } else if (text && href.length > 5) {
+            // IDが見つからない場合もテキストとURLのセットで控える
+            if (!seen.has(text) && text.length > 2) {
+              seen.add(text);
+              list.push({ id: '', text: text, href: href });
             }
           }
         }
         return list;
       });
 
-      for (let i = 0; i < hallLinks.length; i++) {
-        if (hallLinks[i].id === targetId) {
-          detectedRank = (p - 1) * 20 + (i + 1);
-          break;
+      // 1. IDでの完全一致判定
+      if (targetId) {
+        for (let i = 0; i < hallLinks.length; i++) {
+          if (hallLinks[i].id && (hallLinks[i].id === targetId || hallLinks[i].href.toLowerCase().includes(targetId))) {
+            detectedRank = (p - 1) * 20 + (i + 1);
+            break;
+          }
         }
       }
 
+      // 2. 会場名（テキスト）での部分一致判定
       if (detectedRank === 0 && targetName) {
         const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
+        // 主要キーワードを取り出し（例：「アルカンシエル」）
+        const coreKeyword = cleanName.substring(0, 6);
+
         for (let i = 0; i < hallLinks.length; i++) {
-          if (hallLinks[i].text.includes(cleanName)) {
+          if (hallLinks[i].text && (hallLinks[i].text.includes(cleanName) || (coreKeyword.length >= 3 && hallLinks[i].text.includes(coreKeyword)))) {
             detectedRank = (p - 1) * 20 + (i + 1);
             break;
           }
