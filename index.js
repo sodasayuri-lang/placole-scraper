@@ -13,7 +13,7 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称比較用
+  // 名称比較用（表記ゆれ対策）
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
   const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
 
@@ -37,41 +37,40 @@ app.get('/get-rank', async (req, res) => {
 
       const html = response.data;
 
-      // プラコレの式場詳細リンク（/halls/数字）のみを正規表現で抽出
-      // エリアや検索などの共通パスを除外
-      const hallLinkRegex = /\/halls\/(\d+)/g;
+      // プラコレの式場詳細リンク（/halls/xxxx）をすべて抽出
+      // 数字IDだけでなく英数字・ハイフン含むすべてのスラグに対応
+      const hallLinkRegex = /\/halls\/([a-zA-Z0-9_-]+)/g;
       let match;
       const uniqueHallsOnPage = [];
 
       while ((match = hallLinkRegex.exec(html)) !== null) {
-        const hallId = match[1];
-        if (!uniqueHallsOnPage.includes(hallId)) {
-          uniqueHallsOnPage.push(hallId);
+        const hallSlugOrId = match[1];
+        // システム用の固定キーワード・エリア除外
+        const isExclude = ['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa', 'kanazawa'].includes(hallSlugOrId);
+        
+        if (!isExclude && !uniqueHallsOnPage.includes(hallSlugOrId)) {
+          uniqueHallsOnPage.push(hallSlugOrId);
         }
       }
 
-      // 1. 指定された「式場ID」で一致判定
+      // 判定1: ID直接一致
       if (rawTargetId && uniqueHallsOnPage.includes(rawTargetId)) {
         const index = uniqueHallsOnPage.indexOf(rawTargetId);
         detectedRank = (page - 1) * 20 + (index + 1);
         break;
       }
 
-      // 2. IDで引っかからなかった場合：HTMLテキストから式場の登場順を判定
-      // 式場カードブロック（href="/halls/..." を含むブロック）ごとに名称判定
-      if (detectedRank === 0 && uniqueHallsOnPage.length > 0) {
-        // /halls/数字 のリンクでHTMLを区切る
-        const blocks = html.split(/\/halls\/\d+/);
-        let validCardCount = 0;
-
-        for (let i = 1; i < blocks.length; i++) {
-          const blockContent = blocks[i].substring(0, 500); // リンク直後のテキスト500文字
-          const cleanBlockText = blockContent.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
-
-          // ブロック内に式場名キーワードが含まれるか
-          if (cleanBlockText.includes(cleanName) || cleanBlockText.includes(coreKeyword)) {
-            // そのブロックまでに存在するユニークな式場IDの数をカウント
-            detectedRank = (page - 1) * 20 + Math.min(i, uniqueHallsOnPage.length);
+      // 判定2: 名称一致（IDがスラグ化していて数字と不一致の場合のバックアップ）
+      // 式場リストの塊を1つずつ精査
+      let count = 0;
+      for (const item of uniqueHallsOnPage) {
+        count++;
+        // HTML内でそのID/スラグの直後に出てくるテキストブロックを確認
+        const parts = html.split(`/halls/${item}`);
+        if (parts.length > 1) {
+          const contextText = parts[1].substring(0, 400).replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+          if (contextText.includes(cleanName) || contextText.includes(coreKeyword)) {
+            detectedRank = (page - 1) * 20 + count;
             break;
           }
         }
