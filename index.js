@@ -1,5 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,20 +16,25 @@ app.get('/get-rank', async (req, res) => {
 
   let browser;
   try {
-    // インストールされたChromeのパスを明示的に指定して起動
-    browser = await puppeteer.launch({
-      executablePath: puppeteer.executablePath(),
-      headless: true,
+    // 起動設定（Render対応の安定構成）
+    const launchOptions = {
+      headless: 'new',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process'
+        '--single-process',
+        '--disable-gpu'
       ]
-    });
+    };
+
+    // RenderのキャッシュパスにChromeが存在する場合は指定
+    const cachePath = process.env.PUPPETEER_CACHE_DIR || '/opt/render/.cache/puppeteer';
+    
+    browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
     
@@ -99,7 +105,7 @@ app.get('/get-rank', async (req, res) => {
 
   } catch (error) {
     if (browser) await browser.close();
-    console.error('Scraping Error Detail:', error);
+    console.error('Scraping Error Detail:', error.message);
     return res.status(500).json({ error: error.message });
   }
 });
