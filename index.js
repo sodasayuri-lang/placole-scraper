@@ -14,7 +14,7 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 比較用のキーワード（例: "アルカンシエル"）
+  // 名称比較用のキーワード抽出（例: "アルカンシエル"）
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
   const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
 
@@ -34,7 +34,6 @@ app.get('/get-rank', async (req, res) => {
 
     const page = await browser.newPage();
 
-    // PC標準のUser-Agentを設定してブロックを回避
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
@@ -48,37 +47,52 @@ app.get('/get-rank', async (req, res) => {
       }
 
       try {
-        await page.goto(fetchUrl, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        await page.goto(fetchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
       } catch (e) {
-        // タイムアウトしても処理を継続
+        // タイムアウト時も続行
       }
 
-      // JavaScriptの画面描画を少し待機
+      // ★ 動的コンテンツを読み込ませるための自動スクロール処理
+      await page.evaluate(async () => {
+        await new Promise((resolve) => {
+          let totalHeight = 0;
+          const distance = 300;
+          const timer = setInterval(() => {
+            const scrollHeight = document.body.scrollHeight;
+            window.scrollBy(0, distance);
+            totalHeight += distance;
+
+            if (totalHeight >= scrollHeight || totalHeight > 3000) {
+              clearInterval(timer);
+              resolve();
+            }
+          }, 100);
+        });
+      });
+
+      // スクロール完了後の読み込み待ち（1秒）
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // ページ内の要素をブラウザ上で直接抽出・解析
+      // 画面上の式場要素を解析
       const rankResult = await page.evaluate((targetId, fullName, keyword) => {
-        // 式場カードと思われるリンク・見出し・カード要素を全取得
-        const allLinks = Array.from(document.querySelectorAll('a'));
+        // 画面内の全カード / リンク / テキスト要素を巡回
+        const elements = Array.from(document.querySelectorAll('a, div, h2, h3, article'));
         let currentRank = 0;
         const seenUrls = new Set();
 
-        for (const a of allLinks) {
-          const href = a.getAttribute('href') || '';
-          const text = (a.innerText || a.textContent || '').replace(/\s+/g, '');
+        for (const el of elements) {
+          const href = el.getAttribute('href') || el.querySelector('a')?.getAttribute('href') || '';
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
 
-          // 式場詳細ページへのリンク（例: /hall/, /place/, /wedding/, または数字を含むURL）
-          if (href.match(/\/(?:hall|halls|place|places|wedding)\//i) || href.match(/\/\d+/)) {
-            // 重複リンクを排除するためURLのパスで一元化
+          // 式場カードの特定（リンクまたは文章テキストが存在するもの）
+          if (href && (href.includes('/hall') || href.includes('/place') || href.match(/\/\d+/))) {
             const cleanHref = href.split('?')[0];
-            
+
             if (!seenUrls.has(cleanHref) && text.length > 2) {
               seenUrls.add(cleanHref);
               currentRank++;
 
-              // 1. ID判定（例: 718, 1287）
               const isIdMatch = targetId && href.includes(targetId);
-              // 2. 名称判定（例: アルカンシエル南青山）
               const isNameMatch = (fullName && text.includes(fullName)) || (keyword && text.includes(keyword));
 
               if (isIdMatch || isNameMatch) {
@@ -88,10 +102,10 @@ app.get('/get-rank', async (req, res) => {
           }
         }
 
-        // 要素で拾えない場合、画面全体テキストから登場順を推測
-        const bodyText = document.body ? document.body.innerText.replace(/\s+/g, '') : '';
-        if (fullName && bodyText.includes(fullName)) {
-          return 1; // ページ内存在時のフォールバック
+        // 要素で拾えない場合、画面全体テキストから判定
+        const fullBodyText = document.body ? document.body.innerText.replace(/\s+/g, '') : '';
+        if (fullName && fullBodyText.includes(fullName)) {
+          return 1;
         }
 
         return 0;
