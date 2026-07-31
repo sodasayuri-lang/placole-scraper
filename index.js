@@ -17,7 +17,7 @@ app.get('/get-rank', async (req, res) => {
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -25,11 +25,11 @@ app.get('/get-rank', async (req, res) => {
 
     const page = await browser.newPage();
 
-    // 画像やフォントの読み込みをカットして高速化
+    // 不要なリソースを徹底的にカットして高速化
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+      if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -40,19 +40,20 @@ app.get('/get-rank', async (req, res) => {
 
     let detectedRank = 0;
 
+    // 1ページ最大5秒〜10秒で素早く巡回
     for (let p = 1; p <= 3; p++) {
       let pageUrl = targetUrl;
       if (p > 1) {
         pageUrl += (pageUrl.includes('?') ? '&' : '?') + 'page=' + p;
       }
 
-      await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-
-      // 動的コンテンツ描画待ちのために2秒ストップ
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      try {
+        await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      } catch (e) {
+        // タイムアウトしてもそのまま解析へ進む
+      }
 
       const hallLinks = await page.evaluate(() => {
-        // プラコレの全リンクを探索
         const anchors = Array.from(document.querySelectorAll('a'));
         const list = [];
         const seen = new Set();
@@ -61,7 +62,6 @@ app.get('/get-rank', async (req, res) => {
           const href = a.getAttribute('href') || '';
           const text = (a.innerText || '').replace(/\s+/g, '');
 
-          // URLまたは属性からIDを抽出するパターン
           const match = href.match(/\/(?:halls|place|wedding|places)\/([a-zA-Z0-9_-]+)/);
           if (match) {
             const id = match[1].toLowerCase();
@@ -69,9 +69,8 @@ app.get('/get-rank', async (req, res) => {
               seen.add(id);
               list.push({ id: id, text: text, href: href });
             }
-          } else if (text && href.length > 5) {
-            // IDが見つからない場合もテキストとURLのセットで控える
-            if (!seen.has(text) && text.length > 2) {
+          } else if (text && text.length > 2 && href.length > 5) {
+            if (!seen.has(text)) {
               seen.add(text);
               list.push({ id: '', text: text, href: href });
             }
@@ -80,7 +79,7 @@ app.get('/get-rank', async (req, res) => {
         return list;
       });
 
-      // 1. IDでの完全一致判定
+      // 判定処理
       if (targetId) {
         for (let i = 0; i < hallLinks.length; i++) {
           if (hallLinks[i].id && (hallLinks[i].id === targetId || hallLinks[i].href.toLowerCase().includes(targetId))) {
@@ -90,14 +89,10 @@ app.get('/get-rank', async (req, res) => {
         }
       }
 
-      // 2. 会場名（テキスト）での部分一致判定
       if (detectedRank === 0 && targetName) {
         const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-        // 主要キーワードを取り出し（例：「アルカンシエル」）
-        const coreKeyword = cleanName.substring(0, 6);
-
         for (let i = 0; i < hallLinks.length; i++) {
-          if (hallLinks[i].text && (hallLinks[i].text.includes(cleanName) || (coreKeyword.length >= 3 && hallLinks[i].text.includes(coreKeyword)))) {
+          if (hallLinks[i].text && hallLinks[i].text.includes(cleanName)) {
             detectedRank = (p - 1) * 20 + (i + 1);
             break;
           }
