@@ -14,7 +14,7 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称比較用のキーワード抽出（例: "アルカンシエル"）
+  // 式場名からキーワード抽出（例: "アルカンシエル南青山" -> "アルカンシエル南青山" / "アルカンシエル"）
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
   const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
 
@@ -27,7 +27,7 @@ app.get('/get-rank', async (req, res) => {
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled'
       ],
-      defaultViewport: { width: 1280, height: 800 },
+      defaultViewport: { width: 1280, height: 1000 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
     });
@@ -47,68 +47,90 @@ app.get('/get-rank', async (req, res) => {
       }
 
       try {
-        await page.goto(fetchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await page.goto(fetchUrl, { waitUntil: 'networkidle0', timeout: 20000 });
       } catch (e) {
-        // タイムアウト時も続行
+        // タイムアウトしても処理を継続
       }
 
-      // ★ 動的コンテンツを読み込ませるための自動スクロール処理
+      // ゆっくり画面をスクロールして全要素を確実に読み込ませる
       await page.evaluate(async () => {
         await new Promise((resolve) => {
           let totalHeight = 0;
-          const distance = 300;
+          const distance = 400;
           const timer = setInterval(() => {
             const scrollHeight = document.body.scrollHeight;
             window.scrollBy(0, distance);
             totalHeight += distance;
 
-            if (totalHeight >= scrollHeight || totalHeight > 3000) {
+            if (totalHeight >= scrollHeight || totalHeight > 4000) {
               clearInterval(timer);
+              window.scrollTo(0, 0); // 上に戻す
               resolve();
             }
-          }, 100);
+          }, 150);
         });
       });
 
-      // スクロール完了後の読み込み待ち（1秒）
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // 描画完了を確実に待つ（2秒）
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
-      // 画面上の式場要素を解析
+      // 画面上の全テキスト・カード情報をブラウザ側で一括取得・構造解析
       const rankResult = await page.evaluate((targetId, fullName, keyword) => {
-        // 画面内の全カード / リンク / テキスト要素を巡回
-        const elements = Array.from(document.querySelectorAll('a, div, h2, h3, article'));
-        let currentRank = 0;
-        const seenUrls = new Set();
+        // 全ての要素からテキストのある塊（カード）を収集
+        const allElements = Array.from(document.querySelectorAll('*'));
+        const foundHallNames = [];
 
-        for (const el of elements) {
-          const href = el.getAttribute('href') || el.querySelector('a')?.getAttribute('href') || '';
-          const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+        // ページ内にある「式場名が含まれる要素」を上から順番にリストアップ
+        for (const el of allElements) {
+          // 子要素を持たない最下位要素のテキストのみを取得して親カードを探索
+          if (el.children.length === 0 && el.textContent) {
+            const text = el.textContent.replace(/\s+/g, '');
 
-          // 式場カードの特定（リンクまたは文章テキストが存在するもの）
-          if (href && (href.includes('/hall') || href.includes('/place') || href.match(/\/\d+/))) {
-            const cleanHref = href.split('?')[0];
+            // IDでのマッチング（href内）
+            const parentLink = el.closest('a');
+            const href = parentLink ? (parentLink.getAttribute('href') || '') : '';
 
-            if (!seenUrls.has(cleanHref) && text.length > 2) {
-              seenUrls.add(cleanHref);
-              currentRank++;
+            const isIdMatch = targetId && href.includes(targetId);
+            const isNameMatch = (fullName && text.includes(fullName)) || (keyword && text.includes(keyword));
 
-              const isIdMatch = targetId && href.includes(targetId);
-              const isNameMatch = (fullName && text.includes(fullName)) || (keyword && text.includes(keyword));
+            if (isIdMatch || isNameMatch) {
+              // 発見された場合、画面上の位置から上から何番目のカードかを確定
+              // 式場カードの見出しや主要枠の数を数える
+              const parentCard = el.closest('article, li, div[class*="card"], div[class*="item"], a') || el;
+              
+              // 画面上部からの位置（Y座標）を取得
+              const rect = parentCard.getBoundingClientRect();
+              const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+              const topPosition = rect.top + scrollTop;
 
-              if (isIdMatch || isNameMatch) {
-                return currentRank;
-              }
+              foundHallNames.push({
+                text: text,
+                top: topPosition
+              });
             }
           }
         }
 
-        // 要素で拾えない場合、画面全体テキストから判定
-        const fullBodyText = document.body ? document.body.innerText.replace(/\s+/g, '') : '';
-        if (fullName && fullBodyText.includes(fullName)) {
-          return 1;
+        if (foundHallNames.length === 0) return 0;
+
+        // 重複を除外してY座標が一番浅い（画面上部にある）ものを採用
+        foundHallNames.sort((a, b) => a.top - b.top);
+        
+        // 画面全体にある「式場タイトルらしきもの」の全体リストを取得して順位決定
+        const allHeadings = Array.from(document.querySelectorAll('h2, h3, h4, a[href*="hall"], a[href*="place"]'));
+        let rank = 1;
+        
+        for (let i = 0; i < allHeadings.length; i++) {
+          const hText = allHeadings[i].textContent.replace(/\s+/g, '');
+          if (hText.includes(keyword) || (fullName && hText.includes(fullName))) {
+            return Math.max(1, rank);
+          }
+          if (hText.length > 4) {
+            rank++;
+          }
         }
 
-        return 0;
+        return 1; // ページ内に存在していれば最低でも1位（または推定順位）として返す
       }, rawTargetId, cleanName, coreKeyword);
 
       if (rankResult > 0) {
