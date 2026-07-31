@@ -13,7 +13,7 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称検索用の基本キーワード
+  // 名称比較用
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
   const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
 
@@ -37,69 +37,47 @@ app.get('/get-rank', async (req, res) => {
 
       const html = response.data;
 
-      // --- アプローチ1: プラコレのメイン一覧ブロック/カード要素を順番に抽出 ---
-      // メインの式場カードブロック（<article>タグ または 式場カードを構成するクラス）を分割取得
-      let cards = html.split(/<article\b[^>]*>/i);
-      
-      // articleタグで分割できなかった場合、hallsリンクを含む大きなブロック単位で分割
-      if (cards.length <= 1) {
-        cards = html.split(/(?=<div[^>]*class="[^"]*(?:card|item|hall)[^"]*")/i);
+      // プラコレの式場詳細リンク（/halls/数字）のみを正規表現で抽出
+      // エリアや検索などの共通パスを除外
+      const hallLinkRegex = /\/halls\/(\d+)/g;
+      let match;
+      const uniqueHallsOnPage = [];
+
+      while ((match = hallLinkRegex.exec(html)) !== null) {
+        const hallId = match[1];
+        if (!uniqueHallsOnPage.includes(hallId)) {
+          uniqueHallsOnPage.push(hallId);
+        }
       }
 
-      let currentCardRank = 0;
-      let found = false;
+      // 1. 指定された「式場ID」で一致判定
+      if (rawTargetId && uniqueHallsOnPage.includes(rawTargetId)) {
+        const index = uniqueHallsOnPage.indexOf(rawTargetId);
+        detectedRank = (page - 1) * 20 + (index + 1);
+        break;
+      }
 
-      // 最初の分割要素はヘッダー領域なのでスキップ（i = 1から開始）
-      for (let i = 1; i < cards.length; i++) {
-        const cardHtml = cards[i];
+      // 2. IDで引っかからなかった場合：HTMLテキストから式場の登場順を判定
+      // 式場カードブロック（href="/halls/..." を含むブロック）ごとに名称判定
+      if (detectedRank === 0 && uniqueHallsOnPage.length > 0) {
+        // /halls/数字 のリンクでHTMLを区切る
+        const blocks = html.split(/\/halls\/\d+/);
+        let validCardCount = 0;
 
-        // そのブロックが「式場カード」としてのリンクや主要テキストを含んでいるか判定
-        if (cardHtml.includes('/halls/') || cardHtml.includes('c-card') || cardHtml.includes('p-hall')) {
-          currentCardRank++;
+        for (let i = 1; i < blocks.length; i++) {
+          const blockContent = blocks[i].substring(0, 500); // リンク直後のテキスト500文字
+          const cleanBlockText = blockContent.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
 
-          // 1. ID判定
-          const isIdMatch = rawTargetId && (
-            cardHtml.includes(`/halls/${rawTargetId}`) || 
-            cardHtml.includes(`"id":${rawTargetId}`) || 
-            cardHtml.includes(`"id":"${rawTargetId}"`)
-          );
-
-          // 2. 名称判定
-          const cleanCardText = cardHtml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
-          const isNameMatch = cleanCardText.includes(cleanName) || cleanCardText.includes(coreKeyword);
-
-          if (isIdMatch || isNameMatch) {
-            detectedRank = (page - 1) * 20 + currentCardRank;
-            found = true;
+          // ブロック内に式場名キーワードが含まれるか
+          if (cleanBlockText.includes(cleanName) || cleanBlockText.includes(coreKeyword)) {
+            // そのブロックまでに存在するユニークな式場IDの数をカウント
+            detectedRank = (page - 1) * 20 + Math.min(i, uniqueHallsOnPage.length);
             break;
           }
         }
       }
 
-      if (found) break;
-
-      // --- アプローチ2: 直送の式場詳細リンクからユニーク順を判定（フォールバック） ---
-      if (detectedRank === 0) {
-        // メインエリアに存在する /halls/ID のリンクパターンを出現順に取得
-        const matches = html.match(/\/halls\/([a-zA-Z0-9_-]+)/g) || [];
-        const uniqueHalls = [];
-
-        for (const match of matches) {
-          const id = match.replace('/halls/', '');
-          // ナビゲーションやエリア指定などの除外ワード
-          if (!['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa'].includes(id)) {
-            if (!uniqueHalls.includes(id)) {
-              uniqueHalls.push(id);
-            }
-          }
-        }
-
-        if (rawTargetId && uniqueHalls.includes(rawTargetId)) {
-          const idx = uniqueHalls.indexOf(rawTargetId);
-          detectedRank = (page - 1) * 20 + (idx + 1);
-          break;
-        }
-      }
+      if (detectedRank > 0) break;
     }
 
     return res.json({ rank: detectedRank > 0 ? detectedRank : '圏外' });
