@@ -13,9 +13,13 @@ app.get('/get-rank', async (req, res) => {
     return res.status(400).json({ error: 'Valid URL is required' });
   }
 
-  // 名称比較用
+  // 名称比較用（主要キーワード抽出）
   const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-  const coreKeyword = cleanName.length >= 4 ? cleanName.substring(0, 6) : cleanName;
+  const searchKeywords = [
+    cleanName,
+    cleanName.replace('アルカンシエル', ''),
+    cleanName.replace('luxemariage', '').replace('luxe', '')
+  ].filter(k => k.length >= 2);
 
   try {
     let detectedRank = 0;
@@ -37,60 +41,46 @@ app.get('/get-rank', async (req, res) => {
 
       const html = response.data;
 
-      // 1. 式場詳細へのリンク（/halls/xxx）を持つHTMLブロックごとに分割
-      const rawBlocks = html.split(/\/halls\//);
-      let organicRank = 0; // PR枠を除外した純粋な順位カウンター
+      // /halls/ で区切って個々の式場カード枠を取得
+      const blocks = html.split(/\/halls\//);
+      const processedSlugs = new Set();
+      let pageRank = 0;
       let found = false;
 
-      const processedIds = new Set();
-
-      for (let i = 1; i < rawBlocks.length; i++) {
-        const block = rawBlocks[i];
+      for (let i = 1; i < blocks.length; i++) {
+        const block = blocks[i];
         
-        // 最初の単語（IDまたはスラグ）を取得
+        // スラグ（IDまたは英数字）を取得
         const slugMatch = block.match(/^([a-zA-Z0-9_-]+)/);
         if (!slugMatch) continue;
 
         const hallSlug = slugMatch[1];
 
-        // エリアや検索などのシステム用キーワードを除外
-        if (['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa', 'kanazawa'].includes(hallSlug)) {
+        // システム用パス（エリア・検索・都道府県など）を除外
+        if (['prefectures', 'area', 'search', 'tokyo', 'kanagawa', 'osaka', 'aichi', 'ishikawa', 'kanazawa', 'shizuka', 'mie', 'hyogo'].includes(hallSlug)) {
           continue;
         }
 
-        // 先頭500文字のテキストを取得
-        const blockContent = block.substring(0, 500);
+        // 同一ページ内の重複要素（ヘッダー/フッターのリンクなど）を排除
+        if (processedSlugs.has(hallSlug)) continue;
+        processedSlugs.add(hallSlug);
+
+        // 有効な式場要素としてカウント
+        pageRank++;
+
+        const blockContent = block.substring(0, 600);
         const cleanBlockText = blockContent.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
 
-        // PR・ピックアップ枠の判定（広告ブロックならカウントをスキップ）
-        const isPr = blockContent.includes('c-label--pr') || 
-                     blockContent.includes('ピックアップ') || 
-                     blockContent.includes('PR') || 
-                     cleanBlockText.includes('おすすめ枠');
+        // 1. ID一致判定
+        const isIdMatch = rawTargetId && (hallSlug === rawTargetId || blockContent.includes(`"id":${rawTargetId}`));
 
-        // 同一ページ内での重複表示（上部・下部リンク等）を除外
-        if (!processedIds.has(hallSlug)) {
-          processedIds.add(hallSlug);
+        // 2. 名称一致判定
+        const isNameMatch = searchKeywords.some(kw => kw && cleanBlockText.includes(kw));
 
-          // PR枠でない場合のみ、純粋な検索順位を+1カウント
-          if (!isPr) {
-            organicRank++;
-          }
-
-          // 判定A: ID一致
-          const isIdMatch = rawTargetId && (hallSlug === rawTargetId || blockContent.includes(`"id":${rawTargetId}`));
-          
-          // 判定B: 式場名一致
-          const isNameMatch = cleanBlockText.includes(cleanName) || cleanBlockText.includes(coreKeyword);
-
-          if (isIdMatch || isNameMatch) {
-            detectedRank = (page - 1) * 20 + organicRank;
-            found = true;
-
-            // もしPR枠でヒットした場合の最小値補正
-            if (detectedRank === 0) detectedRank = 1;
-            break;
-          }
+        if (isIdMatch || isNameMatch) {
+          detectedRank = (page - 1) * 20 + pageRank;
+          found = true;
+          break;
         }
       }
 
