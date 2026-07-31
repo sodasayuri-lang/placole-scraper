@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 3000;
 
 app.get('/get-rank', async (req, res) => {
   const targetUrl = req.query.url;
-  const targetId = (req.query.id || '').toLowerCase();
-  const targetName = req.query.name || '';
+  const targetId = String(req.query.id || '').trim();
+  const targetName = String(req.query.name || '').trim();
 
   if (!targetUrl) {
     return res.status(400).json({ error: 'URL is required' });
@@ -25,7 +25,7 @@ app.get('/get-rank', async (req, res) => {
 
     const page = await browser.newPage();
 
-    // 不要なリソースを徹底的にカットして高速化
+    // 不要なリソースをカットして超高速化
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
@@ -40,7 +40,6 @@ app.get('/get-rank', async (req, res) => {
 
     let detectedRank = 0;
 
-    // 1ページ最大5秒〜10秒で素早く巡回
     for (let p = 1; p <= 3; p++) {
       let pageUrl = targetUrl;
       if (p > 1) {
@@ -50,49 +49,47 @@ app.get('/get-rank', async (req, res) => {
       try {
         await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
       } catch (e) {
-        // タイムアウトしてもそのまま解析へ進む
+        // タイムアウトしても解析へ進む
       }
 
-      const hallLinks = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll('a'));
+      // プラコレのページ内にある式場カードのリンク・テキストを全取得
+      const hallItems = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll('a[href*="/halls/"]'));
         const list = [];
         const seen = new Set();
 
         for (const a of anchors) {
           const href = a.getAttribute('href') || '';
-          const text = (a.innerText || '').replace(/\s+/g, '');
-
-          const match = href.match(/\/(?:halls|place|wedding|places)\/([a-zA-Z0-9_-]+)/);
+          // /halls/123 などの末尾数字（会場ID）を抽出
+          const match = href.match(/\/halls\/(\d+)/);
           if (match) {
-            const id = match[1].toLowerCase();
-            if (!seen.has(id) && !['search', 'list', 'prefectures', 'areas', 'item'].includes(id)) {
+            const id = match[1];
+            if (!seen.has(id)) {
               seen.add(id);
-              list.push({ id: id, text: text, href: href });
-            }
-          } else if (text && text.length > 2 && href.length > 5) {
-            if (!seen.has(text)) {
-              seen.add(text);
-              list.push({ id: '', text: text, href: href });
+              // カード内のテキストを取得
+              const cardText = (a.innerText || a.parentElement?.innerText || '').replace(/\s+/g, '');
+              list.push({ id: id, text: cardText, href: href });
             }
           }
         }
         return list;
       });
 
-      // 判定処理
+      // 1. 式場IDでの判定 (数字が一致するか)
       if (targetId) {
-        for (let i = 0; i < hallLinks.length; i++) {
-          if (hallLinks[i].id && (hallLinks[i].id === targetId || hallLinks[i].href.toLowerCase().includes(targetId))) {
+        for (let i = 0; i < hallItems.length; i++) {
+          if (hallItems[i].id === targetId) {
             detectedRank = (p - 1) * 20 + (i + 1);
             break;
           }
         }
       }
 
+      // 2. IDで引っかからなかった場合、式場名で判定
       if (detectedRank === 0 && targetName) {
         const cleanName = targetName.split('/')[0].split('(')[0].split('（')[0].replace(/\s+/g, '');
-        for (let i = 0; i < hallLinks.length; i++) {
-          if (hallLinks[i].text && hallLinks[i].text.includes(cleanName)) {
+        for (let i = 0; i < hallItems.length; i++) {
+          if (hallItems[i].text && hallItems[i].text.includes(cleanName)) {
             detectedRank = (p - 1) * 20 + (i + 1);
             break;
           }
